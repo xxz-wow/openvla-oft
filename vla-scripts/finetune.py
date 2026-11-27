@@ -9,7 +9,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Type
+from typing import Dict, Optional, Tuple, Type, Union
 
 import draccus
 import torch
@@ -104,6 +104,7 @@ class FinetuneConfig:
 
     # LoRA
     use_lora: bool = True                            # If True, uses LoRA fine-tuning
+    use_musa_rmsnorm: bool = False                   # Fuse frozen BF16 Llama RMSNorm layers during MUSA LoRA training
     lora_rank: int = 32                              # Rank of LoRA weight matrix
     lora_dropout: float = 0.0                        # Dropout applied to LoRA weights
     merge_lora_during_training: bool = True          # If True, merges LoRA weights and saves result during training
@@ -198,7 +199,7 @@ def load_checkpoint(module_name: str, path: str, step: int, device: str = "cpu")
     return remove_ddp_in_checkpoint(state_dict)
 
 
-def wrap_ddp(module: nn.Module, device_id: int, find_unused: bool = False) -> DDP:
+def wrap_ddp(module: nn.Module, device_id: Union[int, torch.device], find_unused: bool = False) -> DDP:
     """
     Wrap a module with DistributedDataParallel.
 
@@ -232,7 +233,7 @@ def init_module(
     module_class: Type[nn.Module],
     module_name: str,
     cfg: FinetuneConfig,
-    device_id: int,
+    device_id: Union[int, torch.device],
     module_args: dict,
     to_bf16: bool = False,
     find_unused_params: bool = False,
@@ -324,7 +325,7 @@ def run_forward_pass(
         noise, noisy_actions, diffusion_timestep_embeddings = None, None, None
 
     # VLA forward pass
-    with torch.autocast("cuda", dtype=torch.bfloat16):
+    with torch.autocast(ground_truth_actions.device.type, dtype=torch.bfloat16):
         output: CausalLMOutputWithPast = vla(
             input_ids=batch["input_ids"].to(device_id),
             attention_mask=batch["attention_mask"].to(device_id),
@@ -498,7 +499,7 @@ def run_diffusion_sampling(
         )  # (B, llm_dim)
         diffusion_timestep_embeddings = diffusion_timestep_embeddings.unsqueeze(1)  # (B, 1, llm_dim)
 
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.autocast(curr_noisy_actions.device.type, dtype=torch.bfloat16):
             output = vla(
                 input_ids=batch["input_ids"].to(device_id),
                 attention_mask=batch["attention_mask"].to(device_id),
@@ -783,10 +784,17 @@ def finetune(cfg: FinetuneConfig) -> None:
     os.makedirs(run_dir, exist_ok=True)
 
     # GPU setup
+    if cfg.use_musa_rmsnorm:
+        import torch_musa  # noqa: F401 - registers the MUSA backend before Accelerate selects a device
+
     distributed_state = PartialState()
-    device_id = distributed_state.local_process_index
-    torch.cuda.set_device(device_id)
-    torch.cuda.empty_cache()
+    device_type = "musa" if distributed_state.device.type == "musa" else "cuda"
+    if cfg.use_musa_rmsnorm and device_type != "musa":
+        raise RuntimeError("--use_musa_rmsnorm requires Accelerate to select a MUSA device")
+    device_backend = getattr(torch, device_type)
+    device_id = torch.device(device_type, distributed_state.local_process_index)
+    device_backend.set_device(device_id)
+    device_backend.empty_cache()
 
     # Initialize wandb logging
     if distributed_state.is_main_process:
@@ -853,6 +861,15 @@ def finetune(cfg: FinetuneConfig) -> None:
         )
         vla = get_peft_model(vla, lora_config)
         vla.print_trainable_parameters()
+
+        if cfg.use_musa_rmsnorm:
+            from prismatic.models.backbones.llm.musa_rmsnorm import enable_musa_rmsnorm
+
+            count = enable_musa_rmsnorm(vla.get_base_model().language_model)
+            if count == 0:
+                raise RuntimeError("No LlamaRMSNorm layers found in the language model")
+            if distributed_state.is_main_process:
+                print(f"Enabled fused MUSA RMSNorm on {count} Llama layers")
 
     # FiLM setup
     if cfg.use_film:
